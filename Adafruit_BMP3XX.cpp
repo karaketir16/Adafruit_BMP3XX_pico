@@ -26,12 +26,88 @@
  */
 
 #include "Adafruit_BMP3XX.h"
-#include "Arduino.h"
+#include "hardware/i2c.h"
+#include "hardware/gpio.h"
+
+#include <stdio.h>
+
+#include <math.h>
 
 //#define BMP3XX_DEBUG
 
-Adafruit_I2CDevice *g_i2c_dev = NULL; ///< Global I2C interface pointer
-Adafruit_SPIDevice *g_spi_dev = NULL; ///< Global SPI interface pointer
+
+/*******************************************************************************
+ * Function Declarations
+ */
+int reg_write(i2c_inst_t *i2c, 
+                const uint addr, 
+                const uint8_t reg, 
+                const uint8_t *buf,
+                const uint8_t nbytes);
+
+int reg_read(   i2c_inst_t *i2c,
+                const uint addr,
+                const uint8_t reg,
+                uint8_t *buf,
+                const uint8_t nbytes);
+
+/*******************************************************************************
+ * Function Definitions
+ */
+
+// Write 1 byte to the specified register
+int reg_write(  i2c_inst_t *i2c, 
+                const uint addr, 
+                const uint8_t reg, 
+                const uint8_t *buf,
+                const uint8_t nbytes) {
+
+    int num_bytes_read = 0;
+    uint8_t msg[nbytes + 1];
+
+    // Check to make sure caller is sending 1 or more bytes
+    if (nbytes < 1) {
+        return 0;
+    }
+
+    // Append register address to front of data packet
+    msg[0] = reg;
+    for (int i = 0; i < nbytes; i++) {
+        msg[i + 1] = buf[i];
+    }
+
+    // Write data to register(s) over I2C
+    i2c_write_blocking(i2c, addr, msg, (nbytes + 1), false);
+
+    return num_bytes_read;
+}
+
+// Read byte(s) from specified register. If nbytes > 1, read from consecutive
+// registers.
+int reg_read(  i2c_inst_t *i2c,
+                const uint addr,
+                const uint8_t reg,
+                uint8_t *buf,
+                const uint8_t nbytes) {
+
+    int num_bytes_read = 0;
+
+    // Check to make sure caller is asking for 1 or more bytes
+    if (nbytes < 1) {
+        return 0;
+    }
+
+    // Read data from register(s) over I2C
+    i2c_write_blocking(i2c, addr, &reg, 1, true);
+    num_bytes_read = i2c_read_blocking(i2c, addr, buf, nbytes, false);
+
+    return num_bytes_read;
+}
+
+
+
+
+i2c_inst_t *g_i2c_dev = NULL; ///< Global I2C interface pointer
 
 // Our hardware interface functions
 static int8_t i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len,
@@ -73,19 +149,35 @@ Adafruit_BMP3XX::Adafruit_BMP3XX(void) {
     @return True on sensor initialization success. False on failure.
 */
 /**************************************************************************/
-bool Adafruit_BMP3XX::begin_I2C(uint8_t addr, TwoWire *theWire) {
-  if (i2c_dev)
-    delete i2c_dev;
-  if (spi_dev)
-    delete spi_dev;
-  spi_dev = NULL;
+bool Adafruit_BMP3XX::begin_I2C(uint8_t addr) {
 
-  g_i2c_dev = i2c_dev = new Adafruit_I2CDevice(addr, theWire);
+  printf("begin I2C\r\n");
 
-  // verify i2c address was found
-  if (!i2c_dev->begin()) {
-    return false;
-  }
+    // Pins
+    const uint sda_pin = 4;
+    const uint scl_pin = 5;
+
+    // Buffer to store raw reads
+    uint8_t data[6];
+
+  g_i2c_dev = i2c_dev = i2c0;
+
+  i2c_init(i2c_dev, 400 * 1000);
+
+  gpio_set_function(sda_pin, GPIO_FUNC_I2C);
+  gpio_set_function(scl_pin, GPIO_FUNC_I2C);
+
+  //Read device ID to make sure that we can communicate with the ADXL343
+    reg_read(i2c_dev, addr, BMP3_REG_CHIP_ID, data, 1);
+
+
+    if (data[0] != BMP3_CHIP_ID) {
+        printf("ERROR: Could not communicate with BMP3XX\r\n");
+        sleep_ms(1000);
+        while (true);
+    }
+
+
 
   the_sensor.chip_id = addr;
   the_sensor.intf = BMP3_I2C_INTF;
@@ -97,79 +189,10 @@ bool Adafruit_BMP3XX::begin_I2C(uint8_t addr, TwoWire *theWire) {
   return _init();
 }
 
-/*!
- *    @brief  Sets up the hardware and initializes hardware SPI
- *    @param  cs_pin The arduino pin # connected to chip select
- *    @param  theSPI The SPI object to be used for SPI connections.
- *    @return True if initialization was successful, otherwise false.
- */
-bool Adafruit_BMP3XX::begin_SPI(uint8_t cs_pin, SPIClass *theSPI) {
-  if (i2c_dev)
-    delete i2c_dev;
-  if (spi_dev)
-    delete spi_dev;
-  i2c_dev = NULL;
 
-  g_spi_dev = spi_dev =
-      new Adafruit_SPIDevice(cs_pin,
-                             BMP3XX_DEFAULT_SPIFREQ, // frequency
-                             SPI_BITORDER_MSBFIRST,  // bit order
-                             SPI_MODE0,              // data mode
-                             theSPI);
-
-  if (!spi_dev->begin()) {
-    return false;
-  }
-
-  the_sensor.chip_id = cs_pin;
-  the_sensor.intf = BMP3_SPI_INTF;
-  the_sensor.read = &spi_read;
-  the_sensor.write = &spi_write;
-  the_sensor.intf_ptr = g_spi_dev;
-  the_sensor.dummy_byte = 1;
-
-  return _init();
-}
-
-/*!
- *    @brief  Sets up the hardware and initializes software SPI
- *    @param  cs_pin The arduino pin # connected to chip select
- *    @param  sck_pin The arduino pin # connected to SPI clock
- *    @param  miso_pin The arduino pin # connected to SPI MISO
- *    @param  mosi_pin The arduino pin # connected to SPI MOSI
- *    @return True if initialization was successful, otherwise false.
- */
-bool Adafruit_BMP3XX::begin_SPI(int8_t cs_pin, int8_t sck_pin, int8_t miso_pin,
-                                int8_t mosi_pin) {
-  if (i2c_dev)
-    delete i2c_dev;
-  if (spi_dev)
-    delete spi_dev;
-  i2c_dev = NULL;
-
-  g_spi_dev = spi_dev =
-      new Adafruit_SPIDevice(cs_pin, sck_pin, miso_pin, mosi_pin,
-                             BMP3XX_DEFAULT_SPIFREQ, // frequency
-                             SPI_BITORDER_MSBFIRST,  // bit order
-                             SPI_MODE0);             // data mode
-
-  if (!spi_dev->begin()) {
-    return false;
-  }
-
-  the_sensor.chip_id = cs_pin;
-  the_sensor.intf = BMP3_SPI_INTF;
-  the_sensor.read = &spi_read;
-  the_sensor.write = &spi_write;
-  the_sensor.intf_ptr = g_spi_dev;
-  the_sensor.dummy_byte = 1;
-
-  return _init();
-}
 
 bool Adafruit_BMP3XX::_init(void) {
   g_i2c_dev = i2c_dev;
-  g_spi_dev = spi_dev;
   the_sensor.delay_us = delay_usec;
   int8_t rslt = BMP3_OK;
 
@@ -306,7 +329,6 @@ float Adafruit_BMP3XX::readAltitude(float seaLevel) {
 /**************************************************************************/
 bool Adafruit_BMP3XX::performReading(void) {
   g_i2c_dev = i2c_dev;
-  g_spi_dev = spi_dev;
   int8_t rslt;
   /* Used to select the settings user needs to change */
   uint16_t settings_sel = 0;
@@ -490,8 +512,8 @@ int8_t i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len,
   // Serial.print("I2C read address 0x"); Serial.print(reg_addr, HEX);
   // Serial.print(" len "); Serial.println(len, HEX);
 
-  if (!g_i2c_dev->write_then_read(&reg_addr, 1, reg_data, len))
-    return 1;
+  reg_read((i2c_inst_t*)(intf_ptr), BMP3XX_DEFAULT_ADDRESS, reg_addr, reg_data, len);
+
 
   return 0;
 }
@@ -506,36 +528,13 @@ int8_t i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len,
   // Serial.print("I2C write address 0x"); Serial.print(reg_addr, HEX);
   // Serial.print(" len "); Serial.println(len, HEX);
 
-  if (!g_i2c_dev->write((uint8_t *)reg_data, len, true, &reg_addr, 1))
-    return 1;
 
-  return 0;
+  reg_write((i2c_inst_t*)(intf_ptr), BMP3XX_DEFAULT_ADDRESS, reg_addr, reg_data, len);
+
+  return BMP3_INTF_RET_SUCCESS;
 }
 
-/**************************************************************************/
-/*!
-    @brief  Reads 8 bit values over SPI
-*/
-/**************************************************************************/
-static int8_t spi_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len,
-                       void *intf_ptr) {
-  g_spi_dev->write_then_read(&reg_addr, 1, reg_data, len, 0xFF);
-  return 0;
-}
-
-/**************************************************************************/
-/*!
-    @brief  Writes 8 bit values over SPI
-*/
-/**************************************************************************/
-static int8_t spi_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len,
-                        void *intf_ptr) {
-  g_spi_dev->write((uint8_t *)reg_data, len, &reg_addr, 1);
-
-  return 0;
-}
-
-static void delay_usec(uint32_t us, void *intf_ptr) { delayMicroseconds(us); }
+static void delay_usec(uint32_t us, void *intf_ptr) { sleep_us(us); }
 
 static int8_t validate_trimming_param(struct bmp3_dev *dev) {
   int8_t rslt;
